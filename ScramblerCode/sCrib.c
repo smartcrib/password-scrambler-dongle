@@ -18,6 +18,7 @@ Copyright 2013-14, Smart Crib Ltd
 	SHA1GeneratePassword(6, password3);
 	SHA1GeneratePassword(0, password4);
 	
+	greenPressed = 0;
 	mainHostState = HOST_CRYPTO;
 	
 	
@@ -51,6 +52,7 @@ Copyright 2013-14, Smart Crib Ltd
 		if (i<offset){ // a valid command is already in the working buffer
 			processCommand = 1;
 		} else { // read new line
+		    // get ready for reading from USART
 		    if (iocb.get.queue_stat<BUFFER_SIZE-offset){
 				validChars = iocb.get.queue_stat;
 			} else {
@@ -59,20 +61,18 @@ Copyright 2013-14, Smart Crib Ltd
 			vos_dev_read(hUSBSLAVE_FT232, &uartDataTemp[offset], (uint16)validChars, &bytesTransferred);
 			// get the data to process to userDataTemp buffer
 			i=0;
+			// search for end of line
 			while((uartDataTemp[i+offset]!=0xa)&&(uartDataTemp[i+offset]!=0xd)&&(i<bytesTransferred)){
                 // try to find end of line = end of command
 		        i++;
 		    }
-			if (i>=BUFFER_SIZE){ // error - too long line, we may read just a char
+			if ((i+offset)>=BUFFER_SIZE){ // error - too long line, we may read just a char
 							     // at a time so check the complete length
 		    // get rid of the line - 160 chars and set a flag to ignore everything till next \n
-				ignore = 1;
 				offset = 0;
-			} else if (ignore){
-			    vos_memcpy(&uartDataTemp, &(uartDataTemp[i]), bytesTransferred+offset-i);
-				offset = offset+(unsigned char)bytesTransferred-i; // set the offset to no of valid characters
 			} else if ((uartDataTemp[i+offset]==0xa)||(uartDataTemp[i+offset]==0xd)){
 				processCommand = 1;
+				offset += i;
 			} else {
 			    offset += i;
 			}
@@ -134,19 +134,27 @@ Copyright 2013-14, Smart Crib Ltd
 				operation = CMD_MANAGEMENT;
 				if ((scribStatus&FLASH_INIT_LOCKSEED)==0){
 					validChars=32;
-					if (uartDataTemp[10]=='2')
+					if (uartDataTemp[10]=='2') {
 						vos_memcpy(uartDataOut, password2, 32);
-					else if (uartDataTemp[10]=='3')
+					} else if (uartDataTemp[10]=='3') {
 						vos_memcpy(uartDataOut, password3, 32);
-					else if (uartDataTemp[10]=='4')
+					} else if (uartDataTemp[10]=='4') {
 						vos_memcpy(uartDataOut, password4, 32);
-					else {
+					} else {
+						vos_memcpy(uartDataOut, ERR_PARAMS, 6);
+						validChars = 6;
+					}
+				} else if ((scribStatus&FLASH_INIT_LOCKREKEY)==0){
+					validChars=32;
+					if (uartDataTemp[10]=='4'){
+						vos_memcpy(uartDataOut, password4, 32);
+					} else {
 						vos_memcpy(uartDataOut, ERR_PARAMS, 6);
 						validChars = 6;
 					}
 				} else { // we are operational -> error
-                    strcpy((char*)uartDataOut, ERR_CMD);
-                    validChars = strlen(ERR_CMD);
+                    strcpy((char*)uartDataOut, ERR_STATE);
+                    validChars = strlen(ERR_STATE);
                 }
 			} else if (strncmp((char*)uartDataTemp,   "ENGETID",7)==0){
 				operation = CMD_EXECUTION | CMD_REMOTE;
@@ -265,7 +273,7 @@ VOS_ENTER_CRITICAL_SECTION
 						} else {
                             // we originally accepted shorter counterS - j
 VOS_EXIT_CRITICAL_SECTION
-							validChars=scramblePassword(validChars, 0, j+1, j+1);
+							validChars=scramblePassword(validChars, j+1, j+1);
 VOS_ENTER_CRITICAL_SECTION
 						}
 						// we have original challenge (10 bytes, enc. password 32 bytes, and salt
@@ -299,7 +307,7 @@ VOS_ENTER_CRITICAL_SECTION
 VOS_EXIT_CRITICAL_SECTION
 			} else if (strncmp((char*)uartDataTemp, "SCRAMBLE",8)==0){
 				operation = CMD_EXECUTION;
-				validChars = scramblePassword((unsigned short)i, (unsigned short)offset, 9,0);
+				validChars = scramblePassword((unsigned short)offset, 9,0);
 			} else if (strncmp((char*)uartDataTemp, "SETDELAY",8)==0){
 				operation = CMD_EXECUTION;
 				scribCmdDelay=(uartDataTemp[9]-0x30)*10+(uartDataTemp[10]-0x30);
@@ -322,6 +330,46 @@ VOS_EXIT_CRITICAL_SECTION
 					uartDataOut[0] = 0x31;
 				}
 				validChars = 1;
+			} else if (strncmp((char*)uartDataTemp, "REKEY", 5)==0){
+				operation = CMD_MANAGEMENT;
+				
+				if ((scribStatus&FLASH_INIT_LOCKSEED)==0){ // only allowed in processing state
+					vos_memcpy(uartDataOut, ERR_STATE, 6);
+					validChars = 6;
+				} else if (pwdCounters[0]==0xff) { 
+				    //we can do only 255 re-keyings
+					vos_memcpy(uartDataOut, ERR_TOOMANY, 6);
+					validChars = 6;
+				} else if (greenPressed==0){
+					// Green button not pressed - skip the command = error
+					vos_memcpy(uartDataOut, ERR_KEYPRESS, 6);
+					validChars = 6;
+				} else if ((scribStatus&FLASH_INIT_LOCKREKEY)==0){
+					vos_memcpy(uartDataOut, ERR_STATE, 6);
+					validChars = 6;
+				} else { // let's do it!
+					// unlock export of the key
+					scribStatus &= (~FLASH_INIT_LOCKREKEY);
+					flashWrite(FLASH_INIT, (unsigned char *)&scribStatus, FLASH_INIT_SIZE, FALSE);
+
+					addrFlash = FLASH_PASSWORDS+(0*FLASH_PASSWORDS_PER_SW)*FLASH_PASSWORD_ONE; // position of password4
+					flashRead(addrFlash, uartDataOut, FLASH_PASSWORD_FLAG);
+					pwdCounters[0*FLASH_PASSWORDS_PER_SW]++; // increment the counter
+					uartDataOut[PWD_COUNTER] = pwdCounters[0*FLASH_PASSWORDS_PER_SW];		
+
+					flashWrite(addrFlash, uartDataOut, FLASH_PASSWORD_FLAG, FALSE);
+					i = pwdCounters[0*FLASH_PASSWORDS_PER_SW];
+					uartDataOut[0] = 0x30 + (i/100);
+					i = i % 100;
+					uartDataOut[1] = 0x30 + (i/10);
+					i = i % 10;
+					uartDataOut[2] = 0x30 + i;
+					validChars = 3;
+					
+					// and update the password immediately
+					SHA1GeneratePassword(0, password4);
+
+				}
 			} else {
 			    vos_memcpy(uartDataOut, ERR_CMD, 6);
 				validChars = 6;
@@ -347,17 +395,30 @@ VOS_EXIT_CRITICAL_SECTION
 					validChars+=1;
 				}
 			}
+			
+			// if any button was pressed -> reset it after each command execution
+			greenPressed=0;
+			
+			///////FINALISE RESPONSE
+	
 			uartDataOut[validChars]=0x0a;
 			validChars++;			
-			//get rid of the command once processed
-			vos_memcpy(&uartDataTemp[0], &uartDataTemp[i+offset], BUFFER_SIZE-offset-i);
+			//get rid of the command once processed - empty the whole buffer
+			vos_memset(uartDataTemp, 0, BUFFER_SIZE);
+			// send response back to USART
         	vos_dev_write(hUSBSLAVE_FT232, uartDataOut, validChars, (uint16*)&offset);
 			processCommand=0; offset=0;
 			
-			if ((operation&CMD_EXECUTION) && ((scribStatus&FLASH_INIT_LOCKSEED) == 0)){
-				scribStatus&=(~FLASH_INIT_NO_TIME);
-				scribStatus |= (FLASH_INIT_LOCKSEED);  // update the register in EEPROM
-				flashWrite(FLASH_INIT, (unsigned char *)&scribStatus, FLASH_INIT_SIZE, FALSE);
+			if (operation&CMD_EXECUTION){
+				if ((scribStatus&FLASH_INIT_LOCKSEED) == 0){
+					scribStatus&=(~FLASH_INIT_NO_TIME);
+					scribStatus |= (FLASH_INIT_LOCKSEED);  // update the register in EEPROM
+					flashWrite(FLASH_INIT, (unsigned char *)&scribStatus, FLASH_INIT_SIZE, FALSE);
+				}
+				if ((scribStatus&FLASH_INIT_LOCKREKEY) == 0){
+					scribStatus |= (FLASH_INIT_LOCKREKEY);  // update the register in EEPROM
+					flashWrite(FLASH_INIT, (unsigned char *)&scribStatus, FLASH_INIT_SIZE, FALSE);
+				}
 			}
 			
 			// wait if the delay is set
@@ -372,6 +433,7 @@ VOS_EXIT_CRITICAL_SECTION
 #endif
             vos_gpio_write_port(GPIO_PORT_B, LEDState);
         }
+		// collection of randomness - us timer
 		// save another time measurement - source of randomness
 		if (timingsIndex<SEED_MINIMUM_SAMPLES){ // so that we dont get beyond the array boundary
 			// set the tmr_iocb context is it will not be changing
@@ -391,4 +453,4 @@ VOS_EXIT_CRITICAL_SECTION
         writeString(hUart, "\n");
 #endif
 
-    }  // while (1) - run forever
+    }  // while (1) - run forever	
